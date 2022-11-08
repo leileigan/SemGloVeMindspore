@@ -1,7 +1,6 @@
-# SemGloVe: Semantic Co-occurrences for GloVe from BERT[[pdf]](https://arxiv.org/abs/2012.15197)
 
 ## Citation
-Please cite our paper if you find it helpful.
+This is the MindSpore implementation of [SemGloVe: Semantic Co-occurrences for GloVe from BERT](https://arxiv.org/abs/2012.15197). If you find this repository helpful, please cite our paper.
 ```
 @article{gan2020semglove,
   title={SemGloVe: Semantic Co-occurrences for GloVe from BERT},
