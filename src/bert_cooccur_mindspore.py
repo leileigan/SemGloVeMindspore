@@ -10,29 +10,24 @@ import torch
 import datetime, argparse
 import numpy as np
 from tqdm import tqdm
-from transformers import BertModel, BertForMaskedLM, BertTokenizer, BertConfig
-from transformers import DistilBertModel, DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer
-from transformers import RobertaModel, RobertaConfig, RobertaForMaskedLM, RobertaTokenizer
-from transformers import AlbertForMaskedLM, AlbertModel, AlbertConfig, AlbertTokenizer
-from transformers import AutoTokenizer
+import mindspore
+from cybertron import BertTokenizer, BertModel, BertForMaskedLM, BertConfig
+from torch.multiprocessing import Pool
+from allennlp.data.token_indexers import PretrainedTransformerIndexer
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import DataLoader
-from allennlp.data.token_indexers import PretrainedTransformerIndexer
-from torch.multiprocessing import Pool
 
 os.environ['TOKENIZERS_PARALLELISM']='false'
 
 BERT_MAX_LEN = 512
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-MODELS = {'bert-base-unased'    : (BertModel,    BertForMaskedLM,    BertConfig,       BertTokenizer,     'uncased_L-12_H-768_A-12/'),
-          'bert-large-uncased'  : (BertModel,    BertForMaskedLM,    BertConfig,       BertTokenizer,     'bert-large-uncased-whole-word-masking/'),
-          'roberta-large'       : (RobertaModel, RobertaForMaskedLM, RobertaConfig,    RobertaTokenizer,  'roberta-large'),
-          'tacl-bert-base-uncased'       : (BertModel, BertForMaskedLM, BertConfig,    BertTokenizer,      'cambridgeltl-tacl-bert-base-uncased')
+MODELS = {'bert-base-uncased'    : (BertModel,    BertForMaskedLM,    BertConfig,       BertTokenizer,     'bert-base-uncased'),
+          'bert-large-uncased'  : (BertModel,    BertForMaskedLM,    BertConfig,       BertTokenizer,     'bert-large-uncased')
           }
 
 class CustomDataset(Dataset):
-    def __init__(self, model_name, dataset, tokenizer: AutoTokenizer):
+    def __init__(self, model_name, dataset, tokenizer):
         self.model_name = model_name
         self.tokenizer = tokenizer
         self.dataset = dataset
@@ -61,29 +56,29 @@ class CustomDataset(Dataset):
             'line_text': line_text,
             'lengths': len(words),
             'offsets': offsets,
-            'wordpiece_ids': torch.LongTensor(wordpiece_ids),
-            'word_masks': torch.BoolTensor([True] * len(words)),
-            'wordpiece_masks': torch.BoolTensor([True] * len(wordpiece_ids)), 
+            'wordpiece_ids': mindspore.Tensor(wordpiece_ids, mindspore.int64),
+            'word_masks': mindspore.Tensor([True] * len(words), mindspore.bool_),
+            'wordpiece_masks': mindspore.Tensor([True] * len(wordpiece_ids), mindspore.bool_)
         }
 
 def collate_fn(batch_data):
     output = {}
     batch_size = len(batch_data)
-    max_pieces = max(x['wordpiece_masks'].size(0) for x in batch_data)
-    max_words = max(x['word_masks'].size(0) for x in batch_data)
+    max_pieces = max(x['wordpiece_masks'].shape[0] for x in batch_data)
+    max_words = max(x['word_masks'].shape[0] for x in batch_data)
 
     for field in ['wordpiece_ids', 'wordpiece_masks']:
-        pad_output = torch.full([batch_size, max_pieces], 0, dtype=batch_data[0][field].dtype, device=DEVICE)
+        pad_output = mindspore.numpy.full([batch_size, max_pieces], 0, dtype=batch_data[0][field].dtype)
         for sample_idx in range(batch_size):
             data = batch_data[sample_idx][field]
-            pad_output[sample_idx][: data.size(0)] = data            
+            pad_output[sample_idx][: data.shape[0]] = data            
         output[field] = pad_output
 
     for field in ['word_masks']:
-        pad_output = torch.full([batch_size, max_words], 0, dtype=batch_data[0][field].dtype, device=DEVICE)
+        pad_output = mindspore.numpy.full([batch_size, max_words], 0, dtype=batch_data[0][field].dtype)
         for sample_idx in range(batch_size):
             data = batch_data[sample_idx][field]
-            pad_output[sample_idx][: data.size(0)] = data            
+            pad_output[sample_idx][: data.shape[0]] = data            
         output[field] = pad_output
     
     for field in ['offsets']:
@@ -101,7 +96,7 @@ def collate_fn(batch_data):
         output[field] = pad_output
     
     for field in ['lengths']:
-        pad_output = torch.full([batch_size], 0, dtype=torch.long, device=DEVICE)
+        pad_output = mindspore.numpy.full([batch_size], 0, dtype=mindspore.int64)
         for sample_idx in range(batch_size):
             data = batch_data[sample_idx][field]
             pad_output[sample_idx] = data            
@@ -266,44 +261,45 @@ def dump_mlm_predictions(corpus, outpath, batch_size, model, tokenizer, window_s
     start = time.time()
     line_buffer, line_wordpieces_buffer, pred_ids_buffer, pred_scores_buffer = [], [], [], []
 
-    with torch.no_grad():
-        for batch_idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
-            if (batch_idx + 1) % 1e3 == 0:
-                write_buffer = []
-                for i in range(len(line_buffer)):
-                    # print("###" + line_buffer[i])
-                    write_buffer.append('###' + line_buffer[i].strip())
-                    target_tokens = line_wordpieces_buffer[i] #[max_wordpieces]
-                    context_token_ids = pred_ids_buffer[i] #[max_wordpieces, top_k]
-                    context_token_scores = pred_scores_buffer[i] #[max_wordpieces, top_k]
-                    for j in range(0, len(target_tokens)):
-                        target_token = target_tokens[j]
-                        c_tokens = tokenizer.convert_ids_to_tokens(context_token_ids[j+1], skip_special_tokens=True)
-                        c_tokens_len = len(c_tokens)
-                        c_token_scores = context_token_scores[j+1][:c_tokens_len]
-                        # print(f'target token: {target_token} and context_tokens: {c_tokens}')
-                        condidate = target_token + ' ' + ' '.join([item[0] + ':' + str(item[1]) for item in list(zip(c_tokens, c_token_scores))])
-                        write_buffer.append(condidate)
+    for batch_idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
+        if (batch_idx + 1) % 1e3 == 0:
+            write_buffer = []
+            for i in range(len(line_buffer)):
+                # print("###" + line_buffer[i])
+                write_buffer.append('###' + line_buffer[i].strip())
+                target_tokens = line_wordpieces_buffer[i] #[max_wordpieces]
+                context_token_ids = pred_ids_buffer[i] #[max_wordpieces, top_k]
+                context_token_scores = pred_scores_buffer[i] #[max_wordpieces, top_k]
+                for j in range(0, len(target_tokens)):
+                    target_token = target_tokens[j]
+                    c_tokens = tokenizer.convert_ids_to_tokens(context_token_ids[j+1], skip_special_tokens=True)
+                    c_tokens_len = len(c_tokens)
+                    c_token_scores = context_token_scores[j+1][:c_tokens_len]
+                    # print(f'target token: {target_token} and context_tokens: {c_tokens}')
+                    condidate = target_token + ' ' + ' '.join([item[0] + ':' + str(item[1]) for item in list(zip(c_tokens, c_token_scores))])
+                    write_buffer.append(condidate)
 
-                print('%.2fs writing %d batch dump data.' % (time.time() - start, batch_idx + 1))
-                [fout.write(item + '\n') for item in write_buffer]
+            print('%.2fs writing %d batch dump data.' % (time.time() - start, batch_idx + 1))
+            [fout.write(item + '\n') for item in write_buffer]
 
-                sys.stdout.flush()
-                fout.flush()
-                line_buffer, line_wordpieces_buffer, pred_ids_buffer, pred_scores_buffer = [], [], [], []
+            sys.stdout.flush()
+            fout.flush()
+            line_buffer, line_wordpieces_buffer, pred_ids_buffer, pred_scores_buffer = [], [], [], []
 
 
-            input_ids, masks, line_texts = batch_data['wordpiece_ids'], batch_data['wordpiece_masks'], batch_data['line_text']
-            ori_tokenized_text = [tokenizer.convert_ids_to_tokens(item, skip_special_tokens=True) for item in input_ids]
-            lengths, offsets = batch_data["lengths"], batch_data['offsets'] #[batch_size, max_word, 2]
-            batch_size = len(lengths)
-            masked_lm_logits_scores = model(input_ids=input_ids, attention_mask=masks).logits #[batch_size, max_word, vocab_size]
-            top_scores, top_score_ids = torch.topk(masked_lm_logits_scores,k=window_size+1, dim=-1, largest=True) #[batch_size, max_wordpieces, top_k]
+        input_ids, masks, line_texts = batch_data['wordpiece_ids'], batch_data['wordpiece_masks'], batch_data['line_text']
+        ori_tokenized_text = [tokenizer.convert_ids_to_tokens(item, skip_special_tokens=True) for item in input_ids]
+        lengths, offsets = batch_data["lengths"], batch_data['offsets'] #[batch_size, max_word, 2]
+        batch_size = len(lengths)
+        masked_lm_logits_scores = model(input_ids=input_ids, attention_mask=masks)[0]
+        # masked_lm_logits_scores = model(input_ids=input_ids, attention_mask=masks).logits #[batch_size, max_word, vocab_size]
+        topk = mindspore.ops.TopK(sorted=True)
+        top_scores, top_score_ids = topk(masked_lm_logits_scores,window_size+1) #[batch_size, max_wordpieces, top_k]
 
-            line_buffer.extend(line_texts)
-            line_wordpieces_buffer.extend(ori_tokenized_text)
-            pred_ids_buffer.extend(top_score_ids.tolist())
-            pred_scores_buffer.extend(top_scores.tolist())
+        line_buffer.extend(line_texts)
+        line_wordpieces_buffer.extend(ori_tokenized_text)
+        pred_ids_buffer.extend(top_score_ids.asnumpy().tolist())
+        pred_scores_buffer.extend(top_scores.asnumpy().tolist())
             
 
     print('writing final buffer data......')
@@ -590,16 +586,13 @@ def cal_san_word_coo(dump_file, coo_path, window_size, use_divide, use_reciproca
 
 def init_model(model_name, bert_path):
     model_class, masked_model_class,  config_class, tokenizer_class,  path = MODELS[model_name]
-    path = os.path.join(bert_path, path)
     print('Model path:', path)
-    config = config_class.from_pretrained(path)
-    tokenizer = tokenizer_class.from_pretrained(path)
-    model = model_class.from_pretrained(path)
-    masked_model = masked_model_class.from_pretrained(path)
-    model.eval()
-    model.to(DEVICE)
-    masked_model.eval()
-    masked_model.to(DEVICE)
+    config = config_class.load(path)
+    tokenizer = tokenizer_class.load(path)
+    model = model_class.load(path)
+    masked_model = masked_model_class.load(path)
+    model.set_train(False)
+    masked_model.set_train(False)
     print("Model type:", type(model))
     print('Finish loading pre-trained model.')
     return model, masked_model, tokenizer
@@ -701,6 +694,8 @@ if __name__=='__main__':
         print('-' * 50 + 'MLM GLOVE' + '-' * 50)
         dump_path = os.path.join(save_path, model_name, 'mlm', 'dump_weights')
         coo_path = os.path.join(save_path, model_name, 'mlm', 'cooccur', f'window{window_size}')
+        print(f"dump path:{dump_path}")
+        print(f"coo path:{coo_path}")
         if not os.path.exists(dump_path):
             os.makedirs(dump_path)
         if not os.path.exists(coo_path):
